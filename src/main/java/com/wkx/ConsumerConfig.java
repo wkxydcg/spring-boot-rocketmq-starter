@@ -4,7 +4,6 @@ import com.alibaba.rocketmq.client.consumer.DefaultMQPushConsumer;
 import com.alibaba.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import com.alibaba.rocketmq.client.consumer.listener.MessageListenerConcurrently;
 import com.alibaba.rocketmq.client.exception.MQClientException;
-import com.alibaba.rocketmq.common.message.Message;
 import com.alibaba.rocketmq.common.protocol.heartbeat.MessageModel;
 import com.wkx.annotation.MQConsumer;
 import org.slf4j.Logger;
@@ -80,13 +79,13 @@ public class ConsumerConfig implements CommandLineRunner {
                 consumer.subscribe(topic, "*");
                 consumer.setMessageModel(messageModel);
                 consumer.registerMessageListener((MessageListenerConcurrently) (list, consumeConcurrentlyContext) -> {
-                    Message message = list.get(0);
-                    try {
-                        method.invoke(obj, message);
-                        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
-                    } catch (IllegalAccessException | InvocationTargetException e) {
-                        e.printStackTrace();
-                    }
+                    list.forEach(message->{
+                        try {
+                            method.invoke(obj, message);
+                        } catch (IllegalAccessException | InvocationTargetException e) {
+                            LOGGER.error(e.getMessage(),e);
+                        }
+                    });
                     return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
                 });
                 consumer.start();
