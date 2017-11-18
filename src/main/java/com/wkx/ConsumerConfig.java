@@ -4,28 +4,23 @@ import com.alibaba.rocketmq.client.consumer.DefaultMQPushConsumer;
 import com.alibaba.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import com.alibaba.rocketmq.client.consumer.listener.MessageListenerConcurrently;
 import com.alibaba.rocketmq.client.exception.MQClientException;
+import com.alibaba.rocketmq.common.message.MessageExt;
 import com.alibaba.rocketmq.common.protocol.heartbeat.MessageModel;
 import com.wkx.annotation.MQConsumer;
+import com.wkx.annotation.MQTag;
+import org.reflections.Reflections;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-import java.io.File;
-import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.net.JarURLConnection;
-import java.net.URL;
-import java.net.URLDecoder;
-import java.util.ArrayList;
-import java.util.Enumeration;
-import java.util.List;
-import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
+import java.util.*;
 
 /**
  * Created by wkx on 2017/7/19.
@@ -48,131 +43,84 @@ public class ConsumerConfig implements CommandLineRunner {
 
     @Override
     public void run(String... strings) throws Exception {
-        List<Class> classList = scanClass(properties.getConsumerPackage());
+        Reflections reflections=new Reflections(properties.getConsumerPackage());
+        Set<Class<?>> classList = reflections.getTypesAnnotatedWith(MQConsumer.class);
         LOGGER.info("成功扫描类文件:{}个",classList.size());
         handleConsumer(classList);
     }
 
-    private void handleConsumer(List<Class> classes) {
-        for (Class c : classes) {
-            if (!c.isAnnotation() || !c.isInterface()) {
-                Method methods[] = c.getMethods();
-                for (Method m : methods) {
-                    generateConsumer(c, m);
+    private void handleConsumer(Set<Class<?>> classes) throws MQClientException, IllegalAccessException, InstantiationException {
+        String address = properties.getIp() + ":" + properties.getPort();
+        Map<String,Set<Class>> topicMap=new HashMap<>();
+        Map<String,MessageModel> topicModelMap=new HashMap<>();
+        for (Class c:classes){
+            MQConsumer mqConsumer=((MQConsumer)c.getAnnotation(MQConsumer.class));
+            String topicId=mqConsumer.topic();
+            Set<Class> classSet = topicMap.computeIfAbsent(topicId, k -> new HashSet<>());
+            classSet.add(c);
+            assert topicModelMap.get(topicId) == null || topicModelMap.get(topicId)==mqConsumer.messageModel();
+            if(topicModelMap.get(topicId)==null) topicModelMap.put(topicId,mqConsumer.messageModel());
+        }
+        Map<String,Set<Method>> methodMap= MQStoreMap.getMethodMap();
+        Map<Method,Object> methodObjectMap=MQStoreMap.getMethodObjectMap();
+        for (Map.Entry<String,Set<Class>> entry:topicMap.entrySet()){
+            Set<Class> classSet=entry.getValue();
+            Set<Method> methodSet=new HashSet<>();
+            for (Class c:classSet){
+                Object obj=c.newInstance();
+                List<Method> methodList=Arrays.asList(c.getMethods());
+                methodList.forEach(method -> methodObjectMap.put(method,obj));
+                methodSet.addAll(methodList);
+            }
+            methodMap.put(entry.getKey(),methodSet);
+        }
+        for (Map.Entry<String,Set<Method>> entry:methodMap.entrySet()){
+            DefaultMQPushConsumer consumer=createConsumer(entry.getKey(),topicModelMap.get(entry.getKey()),address);
+            MQBeanFactory.registerBean(entry.getKey(),consumer);
+        }
+    }
+
+    private static DefaultMQPushConsumer createConsumer(String topic,MessageModel messageModel,String address) throws MQClientException {
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("ConsumerGroupName");
+        consumer.setNamesrvAddr(address);
+        consumer.setInstanceName("consumer");
+        consumer.subscribe(topic, "*");
+        consumer.setMessageModel(messageModel);
+        consumer.registerMessageListener((MessageListenerConcurrently) (list, consumeConcurrentlyContext) -> {
+            list.forEach(message->{
+                Set<Method> methodSet= MQStoreMap.getMethodMap().get(message.getTopic());
+                if(methodSet.size()==1){
+                    Method method=new ArrayList<>(methodSet).get(0);
+                    if(method.getAnnotation(MQTag.class)==null){
+                        methodInvoke(method,message);
+                    }else{
+                        handleTag(method,message);
+                    }
+                }else{
+                    for (Method method:methodSet){
+                        handleTag(method,message);
+                    }
                 }
-            }
+            });
+            return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+        });
+        consumer.start();
+        return consumer;
+    }
+
+    private static void handleTag(Method method, MessageExt message){
+        MQTag mqTag=method.getAnnotation(MQTag.class);
+        if(mqTag.tag().equals(message.getTags())){
+            methodInvoke(method,message);
         }
     }
 
-    private void generateConsumer(Class aclass, Method method) {
-        MQConsumer annotation = method.getAnnotation(MQConsumer.class);
-        if (annotation != null) {
-            try {
-                final Object obj = aclass.newInstance();
-                if (obj == null) return;
-                String topic = annotation.topic();
-                MessageModel messageModel = annotation.messageModel();
-                DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("ConsumerGroupName");
-                String address = properties.getIp() + ":" + properties.getPort();
-                consumer.setNamesrvAddr(address);
-                consumer.setInstanceName("consumer");
-                consumer.subscribe(topic, "*");
-                consumer.setMessageModel(messageModel);
-                consumer.registerMessageListener((MessageListenerConcurrently) (list, consumeConcurrentlyContext) -> {
-                    list.forEach(message->{
-                        try {
-                            method.invoke(obj, message);
-                        } catch (IllegalAccessException | InvocationTargetException e) {
-                            LOGGER.error(e.getMessage(),e);
-                        }
-                    });
-                    return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
-                });
-                consumer.start();
-            } catch (InstantiationException | IllegalAccessException | MQClientException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private static List<Class> scanClass(String packageName) {
-        String basePackage = packageName.replace(".", "/");
-        List<Class> classList = new ArrayList<>();
+    private static void methodInvoke(Method method,MessageExt message){
+        Object obj=MQStoreMap.getMethodObjectMap().get(method);
         try {
-            Enumeration<URL> dirs = Thread.currentThread().getContextClassLoader().getResources(basePackage);
-            while (dirs.hasMoreElements()) {
-                URL url = dirs.nextElement();
-                String protocol = url.getProtocol();
-                if ("file".equals(protocol)) {
-                    String filePath = URLDecoder.decode(url.getFile(), "UTF-8");
-                    List<Class> classes = scanFile(packageName, filePath);
-                    if (classes != null) classList.addAll(classes);
-                } else if ("jar".equals(protocol)) {
-                    JarFile jar = ((JarURLConnection) url.openConnection()).getJarFile();
-                    classList.addAll(scanJar(packageName, jar));
-                }
-            }
-        } catch (IOException e) {
+            method.invoke(obj,message);
+        } catch (IllegalAccessException | InvocationTargetException e) {
             e.printStackTrace();
         }
-        return classList;
-    }
-
-    private static List<Class> scanFile(String packageName, String packagePath) {
-        List<Class> classList = new ArrayList<>();
-        File dir = new File(packagePath);
-        if (!dir.exists() || !dir.isDirectory()) {
-            return null;
-        }
-        File[] files = dir.listFiles(file -> file.getName().endsWith(".class") || file.isDirectory());
-        if (files == null) return null;
-        for (File file : files) {
-            if (file.isDirectory()) {
-                List<Class> classes = scanFile(getPackageName(packageName, file.getName()), file.getAbsolutePath());
-                if (classes != null) classList.addAll(classes);
-            } else {
-                String className = file.getName().substring(0, file.getName().length() - 6);
-                try {
-                    classList.add(Class.forName(getClassPath(packageName, className)));
-                } catch (ClassNotFoundException e) {
-                    e.printStackTrace();
-                }
-            }
-        }
-        return classList;
-    }
-
-    private static List<Class> scanJar(String pack, JarFile jar) {
-        String packageDir=pack.replace(".","/");
-        List<Class> classList = new ArrayList<>();
-        Enumeration<JarEntry> entries = jar.entries();
-        while (entries.hasMoreElements()) {
-            JarEntry entry = entries.nextElement();
-            String name = entry.getName();
-            if (name.charAt(0) == '/') {
-                name = name.substring(1);
-            }
-            if(name.contains("META-INF")) break;
-            if(!entry.isDirectory()&&name.endsWith(".class")){
-                int beginIndex=name.indexOf(packageDir)+packageDir.length();
-                String className=name.substring(beginIndex,name.length()-6);
-                className=className.replace("/",".");
-                try {
-                    classList.add(Class.forName(className));
-                } catch (Exception |Error ignored) {
-                }
-            }
-        }
-        return classList;
-    }
-
-    private static String getClassPath(String packageName, String className) {
-        if (packageName == null || "".equals(packageName)) return className;
-        return packageName.replace("/", ".") + "." + className;
-    }
-
-    private static String getPackageName(String packageName, String fileName) {
-        if (packageName == null || "".equals(packageName)) return fileName;
-        return packageName + "." + fileName;
     }
 }
